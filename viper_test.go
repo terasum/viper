@@ -276,6 +276,85 @@ func TestUnmarshaling(t *testing.T) {
 	assert.Equal(t, 35, Get("age"))
 }
 
+func ExampleUnmarshalWithMeta() {
+	v := New()
+	type Lib struct {
+		Name    string
+		Awesome bool
+		Useful  bool
+	}
+	var libsCfg struct {
+		Libs map[string]Lib
+	}
+	v.config = map[string]interface{}{
+		"libs": map[string]interface{}{
+			"viper": map[string]interface{}{
+				"name":    "Viper",
+				"awesome": true,
+				"tagline": "Go configuration with fangs!",
+			},
+		},
+		"numbers": []int{4, 8, 15, 16, 23, 42},
+	}
+	meta, _ := v.UnmarshalWithMeta(&libsCfg)
+	// The keys slice is not stable. Sorting them in lexicographical
+	// order allows comparison.
+	sort.Strings(meta.Keys)
+	sort.Strings(meta.Unused)
+	fmt.Printf("%#v\n", meta.Keys)
+	fmt.Printf("%#v", meta.Unused)
+	// Output:
+	// []string{"Libs", "Libs[viper]", "Libs[viper]", "Libs[viper].Awesome", "Libs[viper].Name"}
+	// []string{"Libs[viper].tagline", "numbers"}
+}
+
+func ExampleUnmarshalKeyWithMeta() {
+	v := New()
+	var lib struct {
+		Name    string
+		Awesome bool
+		Useful  bool
+	}
+	v.config = map[string]interface{}{
+		"libs": map[string]interface{}{
+			"viper": map[string]interface{}{
+				"name":    "Viper",
+				"awesome": true,
+				"tagline": "Go configuration with fangs!",
+			},
+		},
+	}
+	meta, _ := v.UnmarshalKeyWithMeta("libs.viper", &lib)
+	fmt.Println(meta.Keys)
+	fmt.Println(meta.Unused)
+	// Output:
+	// [Name Awesome]
+	// [tagline]
+}
+
+func TestUnmarshalKeyWithMeta(t *testing.T) {
+	v := New()
+	v.SetConfigType("yaml")
+	err := v.ReadConfig(bytes.NewBuffer(yamlExample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clothes struct {
+		Jacket string
+		Pants  interface{}
+	}
+	meta, err := v.UnmarshalKeyWithMeta("clothing", &clothes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"Jacket", "Pants"}
+	unused := []string{"trousers"}
+	sort.Strings(meta.Keys)
+	sort.Strings(meta.Unused)
+	assert.Equal(t, keys, meta.Keys, "keys decoded")
+	assert.Equal(t, unused, meta.Unused, "keys in config not in struct")
+}
+
 func TestUnmarshalExact(t *testing.T) {
 	vip := New()
 	target := &testUnmarshalExtra{}
@@ -539,6 +618,44 @@ func TestBindPFlags(t *testing.T) {
 
 }
 
+func TestBindPFlagsStringSlice(t *testing.T) {
+	for _, testValue := range []struct {
+		Expected []string
+		Value    string
+	}{
+		{[]string{}, ""},
+		{[]string{"jeden"}, "jeden"},
+		{[]string{"dwa", "trzy"}, "dwa,trzy"},
+		{[]string{"cztery", "piec , szesc"}, "cztery,\"piec , szesc\""}} {
+
+		for _, changed := range []bool{true, false} {
+			v := New() // create independent Viper object
+			flagSet := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			flagSet.StringSlice("stringslice", testValue.Expected, "test")
+			flagSet.Visit(func(f *pflag.Flag) {
+				if len(testValue.Value) > 0 {
+					f.Value.Set(testValue.Value)
+					f.Changed = changed
+				}
+			})
+
+			err := v.BindPFlags(flagSet)
+			if err != nil {
+				t.Fatalf("error binding flag set, %v", err)
+			}
+
+			type TestStr struct {
+				StringSlice []string
+			}
+			val := &TestStr{}
+			if err := v.Unmarshal(val); err != nil {
+				t.Fatalf("%+#v cannot unmarshal: %s", testValue.Value, err)
+			}
+			assert.Equal(t, testValue.Expected, val.StringSlice)
+		}
+	}
+}
+
 func TestBindPFlag(t *testing.T) {
 	var testString = "testing"
 	var testValue = newStringValue(testString, &testString)
@@ -765,6 +882,26 @@ func TestWrongDirsSearchNotFound(t *testing.T) {
 	v.AddConfigPath(`thispathaintthere`)
 
 	err := v.ReadInConfig()
+	assert.Equal(t, reflect.TypeOf(ConfigFileNotFoundError{"", ""}), reflect.TypeOf(err))
+
+	// Even though config did not load and the error might have
+	// been ignored by the client, the default still loads
+	assert.Equal(t, `default`, v.GetString(`key`))
+}
+
+func TestWrongDirsSearchNotFoundForMerge(t *testing.T) {
+
+	_, config, cleanup := initDirs(t)
+	defer cleanup()
+
+	v := New()
+	v.SetConfigName(config)
+	v.SetDefault(`key`, `default`)
+
+	v.AddConfigPath(`whattayoutalkingbout`)
+	v.AddConfigPath(`thispathaintthere`)
+
+	err := v.MergeInConfig()
 	assert.Equal(t, reflect.TypeOf(ConfigFileNotFoundError{"", ""}), reflect.TypeOf(err))
 
 	// Even though config did not load and the error might have
@@ -1265,6 +1402,35 @@ func TestCaseInsensitiveSet(t *testing.T) {
 	if _, ok := m1["Foo"]; !ok {
 		t.Fatal("Input map changed")
 	}
+}
+
+func TestParseNested(t *testing.T) {
+	type duration struct {
+		Delay time.Duration
+	}
+
+	type item struct {
+		Name   string
+		Delay  time.Duration
+		Nested duration
+	}
+
+	config := `[[parent]]
+	delay="100ms"
+	[parent.nested]
+	delay="200ms"
+`
+	initConfig("toml", config)
+
+	var items []item
+	err := v.UnmarshalKey("parent", &items)
+	if err != nil {
+		t.Fatalf("unable to decode into struct, %v", err)
+	}
+
+	assert.Equal(t, 1, len(items))
+	assert.Equal(t, 100*time.Millisecond, items[0].Delay)
+	assert.Equal(t, 200*time.Millisecond, items[0].Nested.Delay)
 }
 
 func doTestCaseInsensitive(t *testing.T, typ, config string) {

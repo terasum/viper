@@ -21,6 +21,7 @@ package viper
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,18 +34,19 @@ import (
 
 	yaml "gopkg.in/yaml.v2"
 
+	"bufio"
+
 	"github.com/fsnotify/fsnotify"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/printer"
 	"github.com/magiconair/properties"
 	"github.com/mitchellh/mapstructure"
 	toml "github.com/pelletier/go-toml"
+	"github.com/pkg/errors"
 	"github.com/spf13/afero"
 	"github.com/spf13/cast"
 	jww "github.com/spf13/jwalterweatherman"
 	"github.com/spf13/pflag"
-	"github.com/pkg/errors"
-	"bufio"
 )
 
 // ConfigMarshalError happens when failing to marshal the configuration.
@@ -59,6 +61,11 @@ func (e ConfigMarshalError) Error() string {
 
 var v *Viper
 
+type RemoteResponse struct {
+	Value []byte
+	Error error
+}
+
 func init() {
 	v = New()
 }
@@ -66,6 +73,7 @@ func init() {
 type remoteConfigFactory interface {
 	Get(rp RemoteProvider) (io.Reader, error)
 	Watch(rp RemoteProvider) (io.Reader, error)
+	WatchChannel(rp RemoteProvider) (<-chan *RemoteResponse, chan bool)
 }
 
 // RemoteConfig is optional, see the remote package
@@ -736,7 +744,36 @@ func (v *Viper) GetSizeInBytes(key string) uint {
 // UnmarshalKey takes a single key and unmarshals it into a Struct.
 func UnmarshalKey(key string, rawVal interface{}) error { return v.UnmarshalKey(key, rawVal) }
 func (v *Viper) UnmarshalKey(key string, rawVal interface{}) error {
-	return mapstructure.Decode(v.Get(key), rawVal)
+	err := decode(v.Get(key), defaultDecoderConfig(rawVal))
+
+	if err != nil {
+		return err
+	}
+
+	v.insensitiviseMaps()
+
+	return nil
+}
+
+// UnmarshalKeyWithMeta performs UnmarshalKey and provides access to the
+// mapstructure.Metadata in an additional return value.
+func UnmarshalKeyWithMeta(key string, rawVal interface{}) (mapstructure.Metadata, error) {
+	return v.UnmarshalKeyWithMeta(key, rawVal)
+}
+func (v *Viper) UnmarshalKeyWithMeta(key string, rawVal interface{}) (mapstructure.Metadata, error) {
+	var meta mapstructure.Metadata
+	config := defaultDecoderConfig(rawVal)
+	config.Metadata = &meta
+
+	err := decode(v.Get(key), config)
+
+	if err != nil {
+		return meta, err
+	}
+
+	v.insensitiviseMaps()
+
+	return meta, nil
 }
 
 // Unmarshal unmarshals the config into a Struct. Make sure that the tags
@@ -754,7 +791,28 @@ func (v *Viper) Unmarshal(rawVal interface{}) error {
 	return nil
 }
 
-// defaultDecoderConfig returns default mapsstructure.DecoderConfig with suppot
+// UnmarshalWithMeta performs Unmarshal and provides access to the
+// mapstructure.Metadata in an additional return value.
+func UnmarshalWithMeta(rawVal interface{}) (mapstructure.Metadata, error) {
+	return v.UnmarshalWithMeta(rawVal)
+}
+func (v *Viper) UnmarshalWithMeta(rawVal interface{}) (mapstructure.Metadata, error) {
+	var meta mapstructure.Metadata
+	config := defaultDecoderConfig(rawVal)
+	config.Metadata = &meta
+
+	err := decode(v.AllSettings(), config)
+
+	if err != nil {
+		return meta, err
+	}
+
+	v.insensitiviseMaps()
+
+	return meta, nil
+}
+
+// defaultDecoderConfig returns default mapsstructure.DecoderConfig with support
 // of time.Duration values
 func defaultDecoderConfig(output interface{}) *mapstructure.DecoderConfig {
 	return &mapstructure.DecoderConfig{
@@ -903,7 +961,9 @@ func (v *Viper) find(lcaseKey string) interface{} {
 			return cast.ToBool(flag.ValueString())
 		case "stringSlice":
 			s := strings.TrimPrefix(flag.ValueString(), "[")
-			return strings.TrimSuffix(s, "]")
+			s = strings.TrimSuffix(s, "]")
+			res, _ := readAsCSV(s)
+			return res
 		default:
 			return flag.ValueString()
 		}
@@ -970,7 +1030,9 @@ func (v *Viper) find(lcaseKey string) interface{} {
 			return cast.ToBool(flag.ValueString())
 		case "stringSlice":
 			s := strings.TrimPrefix(flag.ValueString(), "[")
-			return strings.TrimSuffix(s, "]")
+			s = strings.TrimSuffix(s, "]")
+			res, _ := readAsCSV(s)
+			return res
 		default:
 			return flag.ValueString()
 		}
@@ -978,6 +1040,15 @@ func (v *Viper) find(lcaseKey string) interface{} {
 	// last item, no need to check shadowing
 
 	return nil
+}
+
+func readAsCSV(val string) ([]string, error) {
+	if val == "" {
+		return []string{}, nil
+	}
+	stringReader := strings.NewReader(val)
+	csvReader := csv.NewReader(stringReader)
+	return csvReader.Read()
 }
 
 // IsSet checks to see if the key has been set in any of the data locations.
@@ -1111,27 +1182,34 @@ func (v *Viper) ReadInConfig() error {
 		return UnsupportedConfigError(v.getConfigType())
 	}
 
+	jww.DEBUG.Println("Reading file: ", filename)
 	file, err := afero.ReadFile(v.fs, filename)
 	if err != nil {
 		return err
 	}
 
-	v.config = make(map[string]interface{})
+	config := make(map[string]interface{})
 
-	return v.unmarshalReader(bytes.NewReader(file), v.config)
+	err = v.unmarshalReader(bytes.NewReader(file), config)
+	if err != nil {
+		return err
+	}
+
+	v.config = config
+	return nil
 }
 
 // MergeInConfig merges a new configuration with an existing config.
 func MergeInConfig() error { return v.MergeInConfig() }
 func (v *Viper) MergeInConfig() error {
 	jww.INFO.Println("Attempting to merge in config file")
-	if !stringInSlice(v.getConfigType(), SupportedExts) {
-		return UnsupportedConfigError(v.getConfigType())
-	}
-
 	filename, err := v.getConfigFile()
 	if err != nil {
 		return err
+	}
+
+	if !stringInSlice(v.getConfigType(), SupportedExts) {
+		return UnsupportedConfigError(v.getConfigType())
 	}
 
 	file, err := afero.ReadFile(v.fs, filename)
@@ -1189,12 +1267,12 @@ func WriteConfigAs(filename string) error { return v.WriteConfigAs(filename) }
 func (v *Viper) WriteConfigAs(filename string) error {
 	return v.writeConfig(filename, true)
 }
-func WriteConfigBuffer()([]byte,error){return v.WriteConfigBuffer()}
-func (v *Viper)WriteConfigBuffer()([]byte,error){
+func WriteConfigBuffer() ([]byte, error) { return v.WriteConfigBuffer() }
+func (v *Viper) WriteConfigBuffer() ([]byte, error) {
 	jww.INFO.Println("Attempting to write configuration to buffer.")
 	configType := v.getConfigType()
 	if !stringInSlice(configType, SupportedExts) {
-		return nil,UnsupportedConfigError(configType)
+		return nil, UnsupportedConfigError(configType)
 	}
 	if v.config == nil {
 		v.config = make(map[string]interface{})
@@ -1347,10 +1425,12 @@ func (v *Viper) marshalWriter(f afero.File, configType string) error {
 		}
 
 	case "toml":
-		t := toml.TreeFromMap(c)
-		s := t.String()
-		_, err := f.WriteString(s)
+		t, err := toml.TreeFromMap(c)
 		if err != nil {
+			return ConfigMarshalError{err}
+		}
+		s := t.String()
+		if _, err := f.WriteString(s); err != nil {
 			return ConfigMarshalError{err}
 		}
 
@@ -1359,28 +1439,27 @@ func (v *Viper) marshalWriter(f afero.File, configType string) error {
 		if err != nil {
 			return ConfigMarshalError{err}
 		}
-		_, err = f.WriteString(string(b))
-		if err != nil {
+		if _, err = f.WriteString(string(b)); err != nil {
 			return ConfigMarshalError{err}
 		}
 	}
 	return nil
 }
 
-func (v *Viper) marshalBuffer(configType string)([]byte,error){
+func (v *Viper) marshalBuffer(configType string) ([]byte, error) {
 	c := v.AllSettings()
 	switch configType {
 	case "json":
 		b, err := json.MarshalIndent(c, "", "  ")
 		if err != nil {
-			return nil,ConfigMarshalError{err}
+			return nil, ConfigMarshalError{err}
 		}
-		return b,nil
+		return b, nil
 
 	case "hcl":
 		b, err := json.Marshal(c)
 		if err != nil {
-			return nil,ConfigMarshalError{err}
+			return nil, ConfigMarshalError{err}
 		}
 		return printer.Format(b)
 
@@ -1392,30 +1471,33 @@ func (v *Viper) marshalBuffer(configType string)([]byte,error){
 		for _, key := range v.AllKeys() {
 			_, _, err := p.Set(key, v.GetString(key))
 			if err != nil {
-				return nil,ConfigMarshalError{err}
+				return nil, ConfigMarshalError{err}
 			}
 		}
-		b := bytes.NewBuffer(make([]byte,0))
+		b := bytes.NewBuffer(make([]byte, 0))
 		bw := bufio.NewWriter(b)
 		_, err := p.WriteComment(bw, "#", properties.UTF8)
 		if err != nil {
-			return nil,ConfigMarshalError{err}
+			return nil, ConfigMarshalError{err}
 		}
 		bw.Flush()
-		return b.Bytes(),nil
+		return b.Bytes(), nil
 
 	case "toml":
-		t := toml.TreeFromMap(c)
-		return []byte(t.String()),nil
+		t, err := toml.TreeFromMap(c)
+		if err != nil {
+			return nil, ConfigMarshalError{err}
+		}
+		return []byte(t.String()), nil
 
 	case "yaml", "yml":
 		b, err := yaml.Marshal(c)
 		if err != nil {
-			return nil,ConfigMarshalError{err}
+			return nil, ConfigMarshalError{err}
 		}
-		return b,nil
+		return b, nil
 	}
-	return nil,ConfigMarshalError{err:errors.New("Unsupport Config Type!")}
+	return nil, ConfigMarshalError{err: errors.New("Unsupport Config Type!")}
 }
 
 func keyExists(k string, m map[string]interface{}) string {
@@ -1526,6 +1608,10 @@ func (v *Viper) WatchRemoteConfig() error {
 	return v.watchKeyValueConfig()
 }
 
+func (v *Viper) WatchRemoteConfigOnChannel() error {
+	return v.watchKeyValueConfigOnChannel()
+}
+
 func (v *Viper) insensitiviseMaps() {
 	insensitiviseMap(v.config)
 	insensitiviseMap(v.defaults)
@@ -1557,6 +1643,23 @@ func (v *Viper) getRemoteConfig(provider RemoteProvider) (map[string]interface{}
 	}
 	err = v.unmarshalReader(reader, v.kvstore)
 	return v.kvstore, err
+}
+
+// Retrieve the first found remote configuration.
+func (v *Viper) watchKeyValueConfigOnChannel() error {
+	for _, rp := range v.remoteProviders {
+		respc, _ := RemoteConfig.WatchChannel(rp)
+		//Todo: Add quit channel
+		go func(rc <-chan *RemoteResponse) {
+			for {
+				b := <-rc
+				reader := bytes.NewReader(b.Value)
+				v.unmarshalReader(reader, v.kvstore)
+			}
+		}(respc)
+		return nil
+	}
+	return RemoteConfigError("No Files Found")
 }
 
 // Retrieve the first found remote configuration.
