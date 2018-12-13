@@ -1097,6 +1097,23 @@ func (v *Viper) Set(key string, value interface{}) {
 	deepestMap[lastKey] = value
 }
 
+// Delete deletes the item with the key in all registers.
+func Delete(key string) { v.Delete(key) }
+func (v *Viper) Delete(key string) {
+	// If alias passed in, then set the proper override
+	key = v.realKey(strings.ToLower(key))
+	path := strings.Split(key, v.keyDelim)
+	lastKey := strings.ToLower(path[len(path)-1])
+	overrideMap := deepSearch(v.override, path[0:len(path)-1])
+	delete(overrideMap, lastKey)
+	configMap := deepSearch(v.config, path[0:len(path)-1])
+	delete(configMap, lastKey)
+	kvstoreMap := deepSearch(v.kvstore, path[0:len(path)-1])
+	delete(kvstoreMap, lastKey)
+	defaultsMap := deepSearch(v.defaults, path[0:len(path)-1])
+	delete(defaultsMap, lastKey)
+}
+
 // ReadInConfig will discover and load the configuration file from disk
 // and key/value stores, searching in one of the defined paths.
 func ReadInConfig() error { return v.ReadInConfig() }
